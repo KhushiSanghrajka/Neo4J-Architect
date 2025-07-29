@@ -1,0 +1,102 @@
+"""
+This module provides functionality to convert markdown files into a graph database using LangChain.
+"""
+from langchain.document_loaders import PyPDFLoader, UnstructuredMarkdownLoader
+from langchain.document_loaders import WebBaseLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import zipfile
+import os
+import glob
+
+# Function to load markdown files from zip
+def load_markdown_from_zip(zip_path):
+    # Create a temporary directory to extract files
+    temp_dir = "temp_md_files"
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
+    
+    # Extract all files from zip
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(temp_dir)
+    
+    # Find all markdown files
+    md_files = glob.glob(os.path.join(temp_dir, "**/*.md"), recursive=True)
+    
+    # Load all markdown files
+    all_docs = []
+    for md_file in md_files:
+        loader = UnstructuredMarkdownLoader(md_file)
+        docs = loader.load()
+        all_docs.extend(docs)
+    
+    return all_docs
+
+# Load documents from zip file
+docs = load_markdown_from_zip("training.zip")  # Replace with your zip file path
+splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+chunks = splitter.split_documents(docs)
+
+from langchain.embeddings import OpenAIEmbeddings
+embedding_model = OpenAIEmbeddings()
+embeddings = embedding_model.embed_documents([doc.page_content for doc in chunks])
+
+from neo4j import GraphDatabase
+
+uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+user = os.getenv("NEO4J_USER", "neo4j")
+password = os.getenv("NEO4J_PASSWORD")
+driver = GraphDatabase.driver(uri, auth=(user, password))
+with driver.session() as session:
+    session.run("""
+        CREATE VECTOR INDEX pydantic_docs IF NOT EXISTS
+        FOR (c:Chunk)
+        ON (c.embedding)
+        OPTIONS {
+          indexConfig: {
+            `vector.dimensions`: 1536,
+            `vector.similarity_function`: 'cosine'
+          }
+        }
+    """)
+
+with driver.session() as session:
+    for i, (doc, emb) in enumerate(zip(chunks, embeddings)):
+        session.run("""
+            CREATE (c:Chunk {
+                content: $text,
+                page: $page,
+                embedding: $embedding
+            }) RETURN id(c) AS cid
+        """, {
+            "text": doc.page_content,
+            "page": doc.metadata.get("page", -1),
+            "embedding": emb
+        })
+
+import shutil
+shutil.rmtree("temp_md_files", ignore_errors=True)
+
+from langchain.vectorstores import Neo4jVector
+
+# Use Neo4jVector with correct index name
+vectorstore = Neo4jVector.from_existing_index(
+    index_name="pydantic_docs",
+    embedding=embedding_model,
+    url="bolt://localhost:7687",
+    username="neo4j",
+    password=os.getenv("NEO4J_PASSWORD")
+)
+
+from langchain.chains import RetrievalQA
+from langchain.chat_models import ChatOpenAI
+retriever = vectorstore.as_retriever()
+qa_chain = RetrievalQA.from_chain_type(
+    llm=ChatOpenAI(),
+    chain_type="stuff",
+    retriever=retriever
+)
+
+# Run query
+query = "How many attributes does the BaseTool class have?"
+response = qa_chain.invoke(query)
+print(response)
